@@ -109,13 +109,20 @@ All restoration models are safe ONNX from [FaceFusion HuggingFace](https://huggi
 
                     # ── Source Image ──────────────────────────────────────────
                     with gr.Group():
-                        gr.Markdown("### 📸 Source Face")
-                        source_image = gr.Image(
-                            label="Source Face (skin texture reference)",
-                            type="pil",
-                            interactive=True,
-                            elem_id="reactor_v4_source"
-                        )
+                        gr.Markdown("### 📸 Source Face(s)")
+                        with gr.Row():
+                            source_image = gr.Image(
+                                label="Source Face 1 (Main)",
+                                type="pil",
+                                interactive=True,
+                                elem_id="reactor_v4_source"
+                            )
+                            source_image_2 = gr.Image(
+                                label="Source Face 2 (Optional - for dual swapping)",
+                                type="pil",
+                                interactive=True,
+                                elem_id="reactor_v4_source_2"
+                            )
 
                     # ── Swapper ───────────────────────────────────────────────
                     with gr.Group():
@@ -130,9 +137,14 @@ All restoration models are safe ONNX from [FaceFusion HuggingFace](https://huggi
                             refresh_btn = gr.Button("🔄", variant="secondary", size="sm", scale=0)
                         with gr.Row():
                             source_idx = gr.Slider(0, 10, step=1, value=0,
-                                label="Source Face Index", elem_id="reactor_v4_src_idx")
+                                label="Source Face 1 Index", elem_id="reactor_v4_src_idx")
                             target_idx = gr.Slider(0, 10, step=1, value=0,
-                                label="Target Face Index", elem_id="reactor_v4_tgt_idx")
+                                label="Target Face 1 Index", elem_id="reactor_v4_tgt_idx")
+                        with gr.Row():
+                            source_idx_2 = gr.Slider(0, 10, step=1, value=0,
+                                label="Source Face 2 Index", elem_id="reactor_v4_src_idx_2")
+                            target_idx_2 = gr.Slider(0, 10, step=1, value=1,
+                                label="Target Face 2 Index", elem_id="reactor_v4_tgt_idx_2")
                         with gr.Row():
                             gender_match = gr.Dropdown(
                                 label="Gender Matching",
@@ -221,6 +233,12 @@ All restoration models are safe ONNX from [FaceFusion HuggingFace](https://huggi
                                 label="Occlusion Handling (hair/glasses)",
                                 value=True, elem_id="reactor_v4_occ_en"
                             )
+                            detail_enhance_en = gr.Checkbox(
+                                label="👁️ Reference Detail Enhancement (Eyes + Teeth)",
+                                value=True, elem_id="reactor_v4_detail_en",
+                                info="Adaptive — auto-detects degradation and injects source detail"
+                            )
+                        with gr.Row():
                             aggressive_cleanup = gr.Checkbox(
                                 label="Aggressive VRAM Cleanup",
                                 value=False, elem_id="reactor_v4_aggressive"
@@ -241,6 +259,11 @@ Target Image → Face Detect → inswapper              │
                     ↓                               │
     Safe ONNX Restorer (auto-download)              │
     RestoreFormer++ / CodeFormer / GFPGAN           │
+                    ↓                               │
+    👁️ Reference Detail Enhancement ◄───────────────┤
+    ■ Adaptive eye detail from source               │
+    ■ Adaptive teeth detail from source             │
+    ■ Eye colour preservation (Lab a/b)             │
                     ↓                               │
     E4S Texture Transfer ◄──────────────────────────┘
     ■ Lab histogram colour match (skin regions)
@@ -272,23 +295,25 @@ Target Image → Face Detect → inswapper              │
                 )
 
                 return [
-                    enabled, source_image,
-                    swapper_model, source_idx, target_idx,
+                    enabled, source_image, source_image_2,
+                    swapper_model, source_idx, target_idx, source_idx_2, target_idx_2,
                     gender_match, swap_strength,
                     enable_restore, restorer_model, restorer_strength,
                     enable_texture, texture_strength, hf_strength,
                     occlusion_en, occlusion_str,
                     aggressive_cleanup,
+                    detail_enhance_en,
                 ]
 
             def process(self, p,
-                        enabled, source_image,
-                        swapper_model, source_idx, target_idx,
+                        enabled, source_image, source_image_2,
+                        swapper_model, source_idx, target_idx, source_idx_2, target_idx_2,
                         gender_match, swap_strength,
                         enable_restore, restorer_model, restorer_strength,
                         enable_texture, texture_strength, hf_strength,
                         occlusion_en, occlusion_str,
-                        aggressive_cleanup):
+                        aggressive_cleanup,
+                        detail_enhance_en):
                 if not enabled or source_image is None:
                     return
                 # Ensure scripts dir is on path (Forge may call from fresh context)
@@ -298,9 +323,12 @@ Target Image → Face Detect → inswapper              │
                     _sys.path.insert(0, _scripts_dir)
                 p.rv4_enabled          = True
                 p.rv4_source           = source_image
+                p.rv4_source_2         = source_image_2
                 p.rv4_swapper          = swapper_model
                 p.rv4_src_idx          = int(source_idx)
                 p.rv4_tgt_idx          = int(target_idx)
+                p.rv4_src_idx_2        = int(source_idx_2)
+                p.rv4_tgt_idx_2        = int(target_idx_2)
                 p.rv4_gender           = gender_match
                 p.rv4_swap_str         = float(swap_strength)
                 p.rv4_restore_en       = bool(enable_restore)
@@ -312,15 +340,17 @@ Target Image → Face Detect → inswapper              │
                 p.rv4_occ_en           = bool(occlusion_en)
                 p.rv4_occ_str          = float(occlusion_str)
                 p.rv4_aggressive       = bool(aggressive_cleanup)
+                p.rv4_detail_en        = bool(detail_enhance_en)
 
             def postprocess_image(self, p, pp,
-                                  enabled, source_image,
-                                  swapper_model, source_idx, target_idx,
+                                  enabled, source_image, source_image_2,
+                                  swapper_model, source_idx, target_idx, source_idx_2, target_idx_2,
                                   gender_match, swap_strength,
                                   enable_restore, restorer_model, restorer_strength,
                                   enable_texture, texture_strength, hf_strength,
                                   occlusion_en, occlusion_str,
-                                  aggressive_cleanup):
+                                  aggressive_cleanup,
+                                  detail_enhance_en):
                 if not enabled or source_image is None:
                     return
                 if not getattr(p, "rv4_enabled", False):
@@ -355,6 +385,7 @@ Target Image → Face Detect → inswapper              │
                         gender_match       = p.rv4_gender,
                         occlusion_enabled  = p.rv4_occ_en,
                         occlusion_strength = p.rv4_occ_str,
+                        enable_detail_enhance = p.rv4_detail_en,
                         auto_cleanup       = True,
                         aggressive_cleanup = p.rv4_aggressive,
                     )
@@ -362,11 +393,24 @@ Target Image → Face Detect → inswapper              │
                         src = cv2.cvtColor(np.array(p.rv4_source), cv2.COLOR_RGB2BGR)
                     else:
                         src = p.rv4_source
+
+                    src2 = None
+                    if p.rv4_source_2 is not None:
+                        if isinstance(p.rv4_source_2, Image.Image):
+                            src2 = cv2.cvtColor(np.array(p.rv4_source_2), cv2.COLOR_RGB2BGR)
+                        else:
+                            src2 = p.rv4_source_2
+
                     tgt = cv2.cvtColor(np.array(pp.image), cv2.COLOR_RGB2BGR)
                     print(f"{TAG} ▸ UI source: type={type(p.rv4_source).__name__}, shape after cvt={src.shape}")
+                    if src2 is not None:
+                        print(f"{TAG} ▸ UI source 2: type={type(p.rv4_source_2).__name__}, shape after cvt={src2.shape}")
                     print(f"{TAG} ▸ UI target (pp.image): PIL size={pp.image.size}, shape after cvt={tgt.shape}")
                     result_bgr, msg = pipeline.process(
-                        src, tgt, p.rv4_src_idx, p.rv4_tgt_idx, p.rv4_swapper
+                        src, tgt, p.rv4_src_idx, p.rv4_tgt_idx, p.rv4_swapper,
+                        source_img_2=src2,
+                        source_face_idx_2=p.rv4_src_idx_2,
+                        target_face_idx_2=p.rv4_tgt_idx_2,
                     )
                     # Diagnostic: compare original vs result
                     diff_check = cv2.absdiff(tgt, result_bgr)

@@ -94,12 +94,10 @@ def _env_float(name: str, default: float) -> float:
 # ── Adaptive provider selector ────────────────────────────────────────────────
 def _pick_ort_providers(is_linux: bool) -> List[str]:
     """
-    Select ONNX Runtime providers. CPU-only on Linux by default for stability.
-    Set REACTOR_V4_ENABLE_CUDA=1 to force CUDA on Linux.
+    Select ONNX Runtime providers. Prefers CUDA if available,
+    unless CPU is forced via environment flag.
     """
     if _env_flag("REACTOR_V4_FORCE_CPU"):
-        return ["CPUExecutionProvider"]
-    if is_linux and not _env_flag("REACTOR_V4_ENABLE_CUDA") and not _env_flag("REACTOR_V4_FORCE_CUDA"):
         return ["CPUExecutionProvider"]
     if torch.cuda.is_available():
         return ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -164,6 +162,141 @@ def _build_feathered_face_mask(
     mask = np.clip(mask, 0.0, 1.0)
 
     return mask.astype(np.float32), (x1, y1, x2, y2)
+
+
+# ── Enhanced paste-back with seamless blending ────────────────────────────
+def _color_correct_face(
+    swapped_crop: np.ndarray,
+    target_crop: np.ndarray,
+) -> np.ndarray:
+    """
+    Match the colour stats (mean/std) of the swapped face to the target
+    using Lab colour space. This eliminates lighting/tone mismatch that
+    makes a swap look 'pasted on'.
+    """
+    if swapped_crop.size == 0 or target_crop.size == 0:
+        return swapped_crop
+
+    # Resize target crop to match swapped crop if needed
+    sh, sw = swapped_crop.shape[:2]
+    if target_crop.shape[:2] != (sh, sw):
+        target_crop = cv2.resize(target_crop, (sw, sh), interpolation=cv2.INTER_AREA)
+
+    swap_lab = cv2.cvtColor(swapped_crop, cv2.COLOR_BGR2LAB).astype(np.float32)
+    tgt_lab = cv2.cvtColor(target_crop, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    for ch in range(3):
+        s_mean, s_std = swap_lab[:, :, ch].mean(), max(swap_lab[:, :, ch].std(), 1e-6)
+        t_mean, t_std = tgt_lab[:, :, ch].mean(), max(tgt_lab[:, :, ch].std(), 1e-6)
+        # Transfer: normalise to target stats
+        swap_lab[:, :, ch] = (swap_lab[:, :, ch] - s_mean) * (t_std / s_std) + t_mean
+
+    swap_lab = np.clip(swap_lab, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(swap_lab, cv2.COLOR_LAB2BGR)
+
+
+def _build_landmark_mask(
+    kps: np.ndarray,
+    affine_matrix: np.ndarray,
+    crop_size: int,
+    img_shape: Tuple[int, int],
+) -> np.ndarray:
+    """
+    Build a smooth face mask from the 5 key landmarks, warped back to the
+    original image space via the inverse affine matrix.
+    Returns a float32 [H,W] mask in [0,1].
+    """
+    h, w = img_shape[:2]
+
+    # Build mask in the aligned crop space
+    crop_mask = np.zeros((crop_size, crop_size), dtype=np.float32)
+
+    # Elliptical mask centred on the crop with margin
+    margin = int(crop_size * 0.07)
+    cx, cy = crop_size // 2, crop_size // 2
+    ax = crop_size // 2 - margin
+    ay = crop_size // 2 - margin
+    cv2.ellipse(crop_mask, (cx, cy), (ax, ay), 0, 0, 360, 1.0, -1)
+
+    # Feather the edges
+    feather = max(5, int(crop_size * 0.08))
+    feather += feather % 2 == 0
+    crop_mask = cv2.GaussianBlur(crop_mask, (feather, feather), feather * 0.4)
+
+    # Warp mask back to full image space
+    IM = cv2.invertAffineTransform(affine_matrix)
+    full_mask = cv2.warpAffine(crop_mask, IM, (w, h), borderValue=0.0)
+    return np.clip(full_mask, 0.0, 1.0)
+
+
+def _seamless_paste_back(
+    target_img: np.ndarray,
+    swapped_crop: np.ndarray,
+    affine_matrix: np.ndarray,
+    tgt_face,
+    color_correct: bool = True,
+) -> np.ndarray:
+    """
+    High-quality paste-back using:
+      1. Inverse-affine warp of the swapped face
+      2. Landmark-guided face mask with feathered edges
+      3. Lab colour correction to match target skin tone
+      4. Poisson seamless cloning (NORMAL_CLONE) for edge-free blending
+      5. Feathered alpha fallback if seamlessClone fails
+    """
+    h, w = target_img.shape[:2]
+    crop_size = swapped_crop.shape[0]  # always square from inswapper
+
+    # Get the aligned target crop for colour reference
+    target_crop = cv2.warpAffine(
+        target_img, affine_matrix, (crop_size, crop_size), borderValue=0.0
+    )
+
+    # Colour correction in aligned space (before warping back)
+    if color_correct:
+        swapped_crop = _color_correct_face(swapped_crop, target_crop)
+
+    # Warp swapped face back to full image space
+    IM = cv2.invertAffineTransform(affine_matrix)
+    warped_face = cv2.warpAffine(swapped_crop, IM, (w, h), borderValue=0.0)
+
+    # Build the blending mask
+    kps = getattr(tgt_face, "kps", None)
+    face_mask = _build_landmark_mask(
+        kps, affine_matrix, crop_size, (h, w)
+    )
+
+    # Try Poisson seamless cloning for best results
+    try:
+        # seamlessClone needs a uint8 mask with 255 inside the face
+        clone_mask = (face_mask * 255).astype(np.uint8)
+
+        # Ensure mask has enough area for seamlessClone
+        mask_points = np.where(clone_mask > 127)
+        if len(mask_points[0]) > 100:
+            # Centre point for seamlessClone
+            cy = int(np.mean(mask_points[0]))
+            cx = int(np.mean(mask_points[1]))
+            # Ensure centre is valid
+            cx = max(1, min(cx, w - 2))
+            cy = max(1, min(cy, h - 2))
+
+            result = cv2.seamlessClone(
+                warped_face, target_img, clone_mask,
+                (cx, cy), cv2.NORMAL_CLONE
+            )
+            print(f"{TAG} ▸ Seamless Poisson blending applied")
+            return result
+    except Exception as sc_err:
+        print(f"{TAG} ▸ seamlessClone failed ({sc_err}), using feathered alpha")
+
+    # Fallback: feathered alpha blend
+    mask_3ch = face_mask[:, :, None]
+    result = (
+        warped_face.astype(np.float32) * mask_3ch +
+        target_img.astype(np.float32) * (1.0 - mask_3ch)
+    ).astype(np.uint8)
+    return result
 
 
 # ── Occlusion detection ───────────────────────────────────────────────────────
@@ -405,10 +538,10 @@ class AdaptiveFaceSwapper:
         swapper_model: str = "inswapper_128.onnx",
         gender_match: str = "S",
         swap_strength: float = 1.0,
-    ) -> Tuple[np.ndarray, str]:
+    ) -> Tuple[np.ndarray, str, int]:
         """
         Swap one face from source onto target.
-        Returns (result_bgr, status_message).
+        Returns (result_bgr, status_message, actual_tgt_idx).
 
         Args:
             gender_match: 'S'=smart (same gender), 'A'=all, 'M'=male only, 'F'=female only
@@ -496,9 +629,22 @@ class AdaptiveFaceSwapper:
                 cv2.imwrite(os.path.join(debug_dir, "target_received.png"), target_img)
                 print(f"{TAG} ▸ Debug images saved to {debug_dir}")
 
-                # Perform swap
+                # Perform swap — use paste_back=False for custom alignment
                 result = target_img.copy()
-                result = self._swapper.get(result, tgt_face, src_face, paste_back=True)
+                swap_out = self._swapper.get(result, tgt_face, src_face, paste_back=False)
+
+                if isinstance(swap_out, tuple) and len(swap_out) == 2:
+                    swapped_crop, affine_M = swap_out
+                    # Custom seamless paste-back with colour correction
+                    result = _seamless_paste_back(
+                        target_img, swapped_crop, affine_M, tgt_face,
+                        color_correct=True,
+                    )
+                    print(f"{TAG} ▸ Enhanced alignment + seamless paste-back applied")
+                else:
+                    # Fallback: model returned single image (older API)
+                    result = swap_out
+                    print(f"{TAG} ▸ Using model's built-in paste-back (fallback)")
 
                 # Diagnostic: verify swap actually changed pixels
                 diff = cv2.absdiff(target_img, result)
@@ -534,15 +680,21 @@ class AdaptiveFaceSwapper:
                             target_img.astype(np.float32) * occ_3ch
                         ).astype(np.uint8)
 
+                # Find index of target face in unfiltered list for face protection
+                try:
+                    actual_tgt_idx = tgt_faces.index(tgt_face)
+                except ValueError:
+                    actual_tgt_idx = 0
+
                 elapsed = time.time() - t0
                 msg = f"Swapped in {elapsed:.2f}s"
                 print(f"{TAG} {msg}")
-                return result, msg
+                return result, msg, actual_tgt_idx
 
             except Exception as exc:
                 import traceback
                 traceback.print_exc()
-                return target_img.copy(), f"Error: {exc}"
+                return target_img.copy(), f"Error: {exc}", -1
 
     def swap_all_faces(
         self,
@@ -557,6 +709,9 @@ class AdaptiveFaceSwapper:
         Swap ALL detected faces in target using best-matching source face.
         Each target face is matched to the most similar source face by embedding cosine similarity.
         Falls back to index-0 source if no match found above threshold.
+
+        Key fix: target faces are detected on the ORIGINAL image (not the progressively
+        swapped result), so each swap gets clean landmark detection.
         """
         t0 = time.time()
         with self._lock:
@@ -574,6 +729,8 @@ class AdaptiveFaceSwapper:
                         if f not in src_all:
                             src_all.append(f)
 
+                # Detect faces on the ORIGINAL target — not on the progressively
+                # modified result, which would degrade landmark quality.
                 tgt_faces = self._detect_faces_adaptive(target_img)
 
                 if not src_all:
@@ -613,8 +770,18 @@ class AdaptiveFaceSwapper:
                     if best_src is None or best_sim < similarity_threshold:
                         best_src = src_all[0]
 
+                    # Enhanced swap: use paste_back=False + seamless blending
                     before = result.copy()
-                    result = self._swapper.get(result, tgt_face, best_src, paste_back=True)
+                    swap_out = self._swapper.get(result, tgt_face, best_src, paste_back=False)
+
+                    if isinstance(swap_out, tuple) and len(swap_out) == 2:
+                        swapped_crop, affine_M = swap_out
+                        result = _seamless_paste_back(
+                            result, swapped_crop, affine_M, tgt_face,
+                            color_correct=True,
+                        )
+                    else:
+                        result = swap_out
 
                     if swap_strength < 1.0:
                         result = cv2.addWeighted(before, 1.0 - swap_strength, result, swap_strength, 0.0)

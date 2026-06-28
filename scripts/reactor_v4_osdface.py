@@ -90,10 +90,7 @@ except ImportError:
 
 
 def _ort_providers() -> List[str]:
-    import platform
-    is_linux = platform.system().lower() == "linux"
-    force_cuda = os.environ.get("REACTOR_V4_ENABLE_CUDA", "0").strip().lower() in {"1", "true"}
-    if is_linux and not force_cuda:
+    if os.environ.get("REACTOR_V4_FORCE_CPU", "0").strip().lower() in {"1", "true"}:
         return ["CPUExecutionProvider"]
     if torch.cuda.is_available():
         return ["CUDAExecutionProvider", "CPUExecutionProvider"]

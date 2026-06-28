@@ -322,6 +322,7 @@ class E4SStyleTextureTransfer:
         self.device = device
         self._parser = FaceRegionParser(device)
         self._vgg = VGGTextureExtractor.get(device) if VGG_AVAILABLE else None
+        self._analyser = None
         self._lock = threading.Lock()
 
     def transfer(
@@ -465,13 +466,22 @@ class E4SStyleTextureTransfer:
         try:
             import insightface
             from insightface.app import FaceAnalysis
-            analyser = FaceAnalysis(
-                name="buffalo_l",
-                root=os.path.expanduser("~/.insightface"),
-                providers=["CPUExecutionProvider"],
-            )
-            analyser.prepare(ctx_id=0, det_size=(640, 640))
-            faces = analyser.get(reference_bgr)
+            if self._analyser is None:
+                from reactor_v4_swapper import _pick_ort_providers
+                import platform
+                is_linux = platform.system().lower() == "linux"
+                providers = _pick_ort_providers(is_linux)
+                use_cpu = "CUDAExecutionProvider" not in providers
+                ctx_id = -1 if use_cpu else 0
+                
+                self._analyser = FaceAnalysis(
+                    name="buffalo_l",
+                    root=os.path.expanduser("~/.insightface"),
+                    providers=providers,
+                )
+                self._analyser.prepare(ctx_id=ctx_id, det_size=(640, 640))
+                
+            faces = self._analyser.get(reference_bgr)
             if faces:
                 face = faces[0]
                 x1, y1, x2, y2 = [int(v) for v in face.bbox]
@@ -482,7 +492,8 @@ class E4SStyleTextureTransfer:
                 crop = reference_bgr[y1:y2, x1:x2]
                 if crop.size > 0:
                     return cv2.resize(crop, (tw, th), interpolation=cv2.INTER_AREA)
-        except Exception:
+        except Exception as e:
+            print(f"{TAG} Warning: _extract_face_region failed ({e}) — using fallback")
             pass
         # Fallback: centre crop
         h, w = reference_bgr.shape[:2]
